@@ -192,6 +192,8 @@ def ejecutar_pipeline(records: list[dict]) -> None:
     2. Enriquece los datos crudos con campos derivados.
     3. Upserta la demanda en demanda_coes (Supabase).
     4. Recalcula la potencia máxima HP y upserta en potencia_hora_punta (Supabase).
+    5. Si es día 1 del mes o la tabla histórica está vacía, extrae y almacena
+       la máxima demanda mensual histórica HP (mes anterior).
     """
     print(f"[ejecutar_pipeline] registros recibidos: {len(records)}")
     if not records:
@@ -205,3 +207,153 @@ def ejecutar_pipeline(records: list[dict]) -> None:
 
     hp_rows = _calcular_potencia_hp(records)
     upsert_hp_supabase(hp_rows)
+
+    # --- Módulo histórico ---
+    if debe_ejecutar_historico(supabase):
+        print("[pipeline] Ejecutando módulo histórico")
+        logger.info("Módulo histórico: iniciando ejecución.")
+        try:
+            from data.coes_historica import obtener_potencia_historica_coes
+            df_historico = obtener_potencia_historica_coes()
+            upsert_potencia_historica(df_historico)
+        except Exception as exc:
+            logger.error("Módulo histórico: error — %s", exc)
+            print(f"[ejecutar_pipeline] ERROR en módulo histórico: {exc}")
+    else:
+        print("[pipeline] Histórico no requerido")
+
+
+# ---------------------------------------------------------------------------
+# Histórico de máxima demanda mensual (HP)
+# ---------------------------------------------------------------------------
+
+def _tabla_historica_vacia() -> bool:
+    """
+    Consulta Supabase para verificar si potencia_hora_punta_historica está vacía.
+    Retorna True si no hay registros (tabla vacía o error de consulta).
+    """
+    try:
+        resp = (
+            supabase.table("potencia_hora_punta_historica")
+            .select("fecha")
+            .limit(1)
+            .execute()
+        )
+        vacia = not bool(resp.data)
+        logger.debug("Tabla histórica vacía: %s", vacia)
+        return vacia
+    except Exception as exc:
+        logger.warning("No se pudo verificar tabla histórica — se asume vacía: %s", exc)
+        return True
+
+
+def historico_mes_ya_cargado(supabase_client) -> bool:
+    """
+    Verifica si el mes anterior ya está cargado en potencia_hora_punta_historica.
+
+    Consulta la fecha máxima de la tabla y la compara con el mes anterior
+    calculado desde la fecha actual.
+
+    Returns:
+        True  si la fecha máxima pertenece al mes anterior.
+        False si no hay datos o la fecha máxima no coincide con el mes anterior.
+    """
+    try:
+        resp = (
+            supabase_client.table("potencia_hora_punta_historica")
+            .select("fecha")
+            .order("fecha", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("historico_mes_ya_cargado: error al consultar — %s", exc)
+        return False
+
+    if not resp.data:
+        return False
+
+    fecha_max_str = resp.data[0]["fecha"]
+    try:
+        fecha_max = datetime.strptime(fecha_max_str, "%Y-%m-%d").date()
+    except ValueError:
+        logger.warning("historico_mes_ya_cargado: fecha inválida en tabla — %r", fecha_max_str)
+        return False
+
+    hoy = date.today()
+    if hoy.month == 1:
+        anio_ant, mes_ant = hoy.year - 1, 12
+    else:
+        anio_ant, mes_ant = hoy.year, hoy.month - 1
+
+    return fecha_max.year == anio_ant and fecha_max.month == mes_ant
+
+
+def debe_ejecutar_historico(supabase_client) -> bool:
+    """
+    Determina si el módulo histórico debe ejecutarse.
+
+    Returns:
+        True  si la tabla está vacía o el mes anterior no está cargado.
+        False si el histórico ya está actualizado.
+    """
+    try:
+        resp = (
+            supabase_client.table("potencia_hora_punta_historica")
+            .select("fecha")
+            .limit(1)
+            .execute()
+        )
+        tabla_vacia = not bool(resp.data)
+    except Exception as exc:
+        logger.warning("debe_ejecutar_historico: error al verificar tabla — se asume vacía: %s", exc)
+        tabla_vacia = True
+
+    if tabla_vacia:
+        print("[pipeline] Tabla histórica vacía")
+        logger.info("Módulo histórico: tabla vacía — ejecución requerida.")
+        return True
+
+    if not historico_mes_ya_cargado(supabase_client):
+        print("[pipeline] Mes anterior no cargado")
+        logger.info("Módulo histórico: mes anterior no cargado — ejecución requerida.")
+        return True
+
+    print("[pipeline] Histórico ya actualizado")
+    logger.info("Módulo histórico: mes anterior ya cargado — omitiendo ejecución.")
+    return False
+
+
+def upsert_potencia_historica(df) -> None:
+    """
+    Inserta o actualiza registros en potencia_hora_punta_historica.
+    Clave de conflicto: fecha.
+
+    Args:
+        df: DataFrame con columnas fecha, potencia_maxima, hora, minuto.
+    """
+    if df is None or df.empty:
+        print("[upsert_potencia_historica] DataFrame vacío — nada que insertar.")
+        logger.info("potencia_hora_punta_historica: DataFrame vacío, sin inserción.")
+        return
+
+    print(f"\n[upsert_potencia_historica] Vista previa del DataFrame:")
+    print(df.head())
+
+    rows = df.to_dict(orient="records")
+
+    print(f"\n[upsert_potencia_historica] {len(rows)} registros listos para insertar")
+    print(f"[upsert_potencia_historica] Rango de fechas: {df['fecha'].min()} → {df['fecha'].max()}")
+    print(f"[upsert_potencia_historica] Ejemplo de fila: {rows[0]}")
+
+    try:
+        resp = supabase.table("potencia_hora_punta_historica").upsert(rows).execute()
+        if hasattr(resp, "data") and resp.data is not None:
+            print(f"[upsert_potencia_historica] OK — {len(resp.data)} filas confirmadas por Supabase.")
+            logger.info("potencia_hora_punta_historica: %d registros procesados.", len(rows))
+        else:
+            print(f"[upsert_potencia_historica] ADVERTENCIA — resp.data vacío o None. resp={resp}")
+            logger.warning("potencia_hora_punta_historica: upsert sin datos confirmados. resp=%s", resp)
+    except Exception as exc:
+        print(f"[upsert_potencia_historica] EXCEPCION: {exc}")
+        logger.error("potencia_hora_punta_historica: error al hacer upsert — %s", exc)

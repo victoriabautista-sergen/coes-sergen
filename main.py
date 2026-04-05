@@ -9,6 +9,7 @@ import sys
 
 from data.coes_demanda import obtener_demanda_mes_actual
 from data.almacenamiento import ejecutar_pipeline
+from data.coes_historica import obtener_potencia_historica_coes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +43,23 @@ def main() -> None:
     print(f"{'='*55}\n")
 
     ejecutar_pipeline(records)
+
+    # --- DEBUG: visualizar datos históricos COES ---
+    for intento in range(1, 3):
+        try:
+            df = obtener_potencia_historica_coes()
+            print("\n===== DATOS HISTORICOS =====")
+            print(df.head(10))
+            print("\n===== ULTIMAS FILAS =====")
+            print(df.tail(10))
+            print("\nTOTAL FILAS:", len(df))
+            break
+        except Exception as e:
+            if intento < 2:
+                print(f"\n⚠️  Intento {intento} fallido, reintentando...")
+            else:
+                print("\n❌ ERROR AL CONSULTAR COES:")
+                print(str(e))
 
 
 if __name__ == "__main__":
