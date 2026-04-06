@@ -1,35 +1,38 @@
 """
 data/coes_historica.py
-Extrae la máxima demanda diaria HP desde el portal COES.
+Extrae la máxima demanda diaria HP oficial desde la tabla HTML del portal COES.
 
-Endpoint: POST https://www.coes.org.pe/Portal/portalinformacion/Demanda
-Respuesta: JSON con dos fuentes de datos:
-  - raw["Chart"]["Series"][0]["Data"]  → serie gráfica (tiempo real / operativa)
-  - raw["Data"]                        → ValorEjecutado (demanda oficial ejecutada)
+Fuente:
+  GET https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima
 
-Lógica de selección de fuente:
-  - Mes actual  → Chart.Series[0].Data  (datos operativos en tiempo real)
-  - Mes anterior → raw["Data"].ValorEjecutado (datos oficiales ejecutados)
+Lógica:
+  - Descarga la página HTML con la tabla de demanda máxima.
+  - Extrae la tabla que contiene las columnas Fecha / HFP / HP DEMANDA SEIN.
+  - Filtra al mes anterior completo.
+  - Devuelve el valor oficial publicado por COES (usado en facturación).
 
 Función pública principal:
     obtener_potencia_historica_coes() -> pd.DataFrame
-        Columnas: fecha (str YYYY-MM-DD), potencia_maxima (float), hora (int), minuto (int)
-        Una fila por día = máxima demanda en Hora Punta (18:00–23:59).
+        Columnas: fecha (str YYYY-MM-DD), potencia_maxima (float),
+                  hora (None), minuto (None), source (str)
+        Una fila por día = máxima demanda HP oficial COES.
 """
 
 import calendar
 import logging
-import re
 import socket
 import time
-from datetime import date, datetime
+from datetime import date
+from io import StringIO
 
 import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
 
-_URL_DEMANDA = "https://www.coes.org.pe/Portal/portalinformacion/Demanda"
+_URL_HTML = (
+    "https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima"
+)
 
 _HEADERS = {
     "User-Agent": (
@@ -37,27 +40,27 @@ _HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima",
-    "Origin": "https://www.coes.org.pe",
+    "Referer": "https://www.coes.org.pe/Portal/portalinformacion/demanda",
 }
 
-# Hora Punta: 18:00 – 23:59
-_HP_HORA_INICIO = 18
-_HP_HORA_FIN = 23
+_FETCH_RETRIES = 3
+_FETCH_RETRY_DELAY = 5  # segundos entre reintentos
+
+# Columna objetivo en la tabla HTML (búsqueda case-insensitive parcial)
+_COL_HP_SEIN = "hp demanda sein"
+_COL_FECHA = "fecha"
 
 
 # ---------------------------------------------------------------------------
 # Rango de fechas
 # ---------------------------------------------------------------------------
 
-def _rango_mes_anterior() -> tuple[str, str, int, int]:
+def _rango_mes_anterior() -> tuple[str, str, int, int, int]:
     """
-    Devuelve (fecha_inicial, fecha_final, anio, mes) del mes anterior.
-    fecha_inicial / fecha_final en formato DD/MM/YYYY.
+    Devuelve (fecha_inicial_iso, fecha_final_iso, anio, mes, dias) del mes anterior.
+    Las fechas están en formato YYYY-MM-DD.
     """
     hoy = date.today()
     if hoy.month == 1:
@@ -66,60 +69,42 @@ def _rango_mes_anterior() -> tuple[str, str, int, int]:
         anio, mes = hoy.year, hoy.month - 1
 
     ultimo_dia = calendar.monthrange(anio, mes)[1]
-    fecha_inicial = f"01/{mes:02d}/{anio}"
-    fecha_final = f"{ultimo_dia:02d}/{mes:02d}/{anio}"
-    return fecha_inicial, fecha_final, anio, mes
-
-
-def _es_mes_actual(anio: int, mes: int) -> bool:
-    """Retorna True si (anio, mes) corresponde al mes actual."""
-    hoy = date.today()
-    return hoy.year == anio and hoy.month == mes
+    fecha_inicial = f"{anio}-{mes:02d}-01"
+    fecha_final = f"{anio}-{mes:02d}-{ultimo_dia:02d}"
+    return fecha_inicial, fecha_final, anio, mes, ultimo_dia
 
 
 # ---------------------------------------------------------------------------
-# Llamada al endpoint
+# Descarga HTML
 # ---------------------------------------------------------------------------
 
-_FETCH_RETRIES = 3
-_FETCH_RETRY_DELAY = 5  # segundos entre reintentos
-
-
-def _fetch_demanda(fecha_inicial: str, fecha_final: str, timeout: int = 30) -> dict:
+def _fetch_html(timeout: int = 30) -> str:
     """
-    Llama al endpoint AJAX del COES y devuelve el JSON parseado.
+    Descarga el HTML de la página de demanda máxima del COES.
+    Reintenta hasta _FETCH_RETRIES veces ante errores de red.
 
-    - Usa session.trust_env = False para ignorar proxies del entorno.
-    - Reintenta hasta _FETCH_RETRIES veces ante errores de red.
-    - En cada fallo loggea el tipo de error con mensajes claros.
+    Returns:
+        Contenido HTML como string.
 
     Raises:
         requests.HTTPError: Si el servidor devuelve un código de error HTTP.
-        ValueError: Si la respuesta no es JSON válido.
-        requests.exceptions.ConnectionError: Si no se pudo establecer conexión tras todos los reintentos.
+        requests.exceptions.ConnectionError: Si no se pudo establecer conexión.
     """
-    payload = {
-        "indicador": "maxima",
-        "fechaInicial": fecha_inicial,
-        "fechaFinal": fecha_final,
-    }
-
-    logger.info("[NETWORK] POST %s — payload: %s", _URL_DEMANDA, payload)
+    logger.info("[NETWORK] GET %s", _URL_HTML)
 
     session = requests.Session()
-    session.trust_env = False  # ignora HTTP_PROXY / HTTPS_PROXY del entorno
+    session.trust_env = False
 
     last_exc: Exception | None = None
 
     for intento in range(1, _FETCH_RETRIES + 1):
         try:
             logger.debug("[NETWORK] Intento %d/%d …", intento, _FETCH_RETRIES)
-            resp = session.post(
-                _URL_DEMANDA,
-                data=payload,
+            resp = session.get(
+                _URL_HTML,
                 headers=_HEADERS,
                 timeout=timeout,
-                proxies={"http": None, "https": None},  # fallback explícito sin proxy
+                proxies={"http": None, "https": None},
             )
         except socket.gaierror as exc:
             last_exc = exc
@@ -134,275 +119,227 @@ def _fetch_demanda(fecha_inicial: str, fecha_final: str, timeout: int = 30) -> d
                 "[NETWORK ERROR] Intento %d — Timeout al conectar con COES (timeout=%ds): %s",
                 intento, timeout, exc,
             )
-            print(f"[ERROR CONEXIÓN] Timeout al conectar con COES — intento {intento}/{_FETCH_RETRIES}")
+            print(f"[ERROR CONEXIÓN] Timeout — intento {intento}/{_FETCH_RETRIES}")
         except requests.exceptions.ConnectionError as exc:
             last_exc = exc
-            # Distinguir DNS de otros errores de conexión
             cause = str(exc)
             if "getaddrinfo" in cause or "gaierror" in cause:
-                logger.error(
-                    "[NETWORK ERROR] Intento %d — Fallo DNS (getaddrinfo): %s", intento, exc
-                )
+                logger.error("[NETWORK ERROR] Intento %d — Fallo DNS: %s", intento, exc)
                 print(f"[ERROR RED] No se pudo resolver dominio — intento {intento}/{_FETCH_RETRIES}")
             else:
-                logger.error(
-                    "[NETWORK ERROR] Intento %d — Error de conexión: %s", intento, exc
-                )
-                print(f"[ERROR CONEXIÓN] Timeout al conectar con COES — intento {intento}/{_FETCH_RETRIES}")
+                logger.error("[NETWORK ERROR] Intento %d — Error de conexión: %s", intento, exc)
+                print(f"[ERROR CONEXIÓN] Error de conexión — intento {intento}/{_FETCH_RETRIES}")
         else:
-            # Conexión exitosa — validar respuesta HTTP
             logger.info("[NETWORK] COES OK — HTTP %d", resp.status_code)
-
             if resp.status_code != 200:
                 raise requests.HTTPError(
-                    f"El endpoint COES devolvió status {resp.status_code}. "
-                    f"URL: {_URL_DEMANDA} — Respuesta: {resp.text[:200]}"
+                    f"El portal COES devolvió status {resp.status_code}. "
+                    f"URL: {_URL_HTML}"
                 )
+            return resp.text
 
-            try:
-                data = resp.json()
-            except ValueError as exc:
-                raise ValueError(
-                    f"La respuesta del endpoint COES no es JSON válido. "
-                    f"Primeros 300 chars: {resp.text[:300]!r}"
-                ) from exc
-
-            logger.info(
-                "[NETWORK] Endpoint COES OK — claves raíz: %s",
-                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-            )
-            return data
-
-        # Esperar antes del siguiente intento (no esperar tras el último)
         if intento < _FETCH_RETRIES:
             logger.debug("[NETWORK] Reintentando en %ds …", _FETCH_RETRY_DELAY)
             time.sleep(_FETCH_RETRY_DELAY)
 
-    # Todos los intentos fallaron
     raise requests.exceptions.ConnectionError(
-        f"No se pudo conectar al endpoint COES tras {_FETCH_RETRIES} intentos. "
+        f"No se pudo conectar al portal COES tras {_FETCH_RETRIES} intentos. "
         f"Último error: {last_exc}"
     ) from last_exc
 
 
 # ---------------------------------------------------------------------------
-# FUENTE OFICIAL: raw["Data"] → ValorEjecutado (meses cerrados)
+# Parseo de la tabla HTML
 # ---------------------------------------------------------------------------
 
-_RE_FECHA_OFICIAL = re.compile(r"^(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2})$")
-
-
-def _parsear_punto_oficial(punto: dict) -> dict | None:
+def _encontrar_columna(columnas: list[str], patron: str) -> str | None:
     """
-    Convierte un punto de raw["Data"] a dict con fecha, hora, minuto, potencia_maxima.
-    Formato de Fecha: "YYYY/MM/DD HH:MM"
-    Retorna None si el punto no es válido.
+    Busca case-insensitivamente una columna cuyo nombre contenga `patron`.
+    Retorna el nombre real de la columna o None si no se encuentra.
     """
-    fecha_str = (punto.get("Fecha") or "").strip()
-    valor = punto.get("ValorEjecutado")
+    patron_lower = patron.lower()
+    for col in columnas:
+        if patron_lower in str(col).lower():
+            return col
+    return None
 
-    if not fecha_str or valor is None:
+
+def _limpiar_numero(valor) -> float | None:
+    """
+    Convierte un valor con posibles separadores de miles a float.
+    Ej: "6,789.12" → 6789.12 | "6.789,12" → 6789.12
+    """
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return None
-
-    m = _RE_FECHA_OFICIAL.match(fecha_str)
-    if not m:
-        logger.debug("Timestamp oficial con formato inesperado: %r — omitido", fecha_str)
-        return None
-
-    anio, mes, dia, hora, minuto = m.groups()
+    texto = str(valor).strip().replace(" ", "")
+    # Si tiene coma y punto, detectar cuál es el separador decimal
+    if "," in texto and "." in texto:
+        # Formato europeo: 6.789,12 → punto=miles, coma=decimal
+        if texto.rindex(",") > texto.rindex("."):
+            texto = texto.replace(".", "").replace(",", ".")
+        else:
+            # Formato anglosajón: 6,789.12 → coma=miles, punto=decimal
+            texto = texto.replace(",", "")
+    elif "," in texto:
+        # Solo comas: puede ser separador de miles o decimal
+        # Si hay exactamente una coma con 3 dígitos después → separador de miles
+        partes = texto.split(",")
+        if len(partes) == 2 and len(partes[1]) == 3 and partes[1].isdigit():
+            texto = texto.replace(",", "")
+        else:
+            texto = texto.replace(",", ".")
     try:
-        potencia = float(valor)
-    except (TypeError, ValueError):
-        logger.debug("ValorEjecutado no numérico: %r — omitido", valor)
+        return float(texto)
+    except ValueError:
         return None
 
-    return {
-        "fecha": f"{anio}-{mes}-{dia}",
-        "hora": int(hora),
-        "minuto": int(minuto),
-        "potencia_maxima": potencia,
-    }
 
-
-def _max_hp_oficial(raw: dict) -> pd.DataFrame:
+def _parsear_fecha(valor) -> str | None:
     """
-    Extrae la máxima HP por día desde raw["Data"] (ValorEjecutado).
-    Esta es la fuente oficial de datos ejecutados del COES.
+    Intenta convertir el valor de fecha a formato YYYY-MM-DD.
+    Acepta: datetime, date, strings con formatos DD/MM/YYYY, YYYY-MM-DD, DD-MM-YYYY.
+    """
+    if pd.isnull(valor) if not isinstance(valor, str) else not valor:
+        return None
+
+    if hasattr(valor, "strftime"):
+        return valor.strftime("%Y-%m-%d")
+
+    texto = str(valor).strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return pd.to_datetime(texto, format=fmt).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+
+    # Último recurso: pandas inferencia
+    try:
+        return pd.to_datetime(texto, dayfirst=True).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _extraer_tabla_hp(html: str) -> pd.DataFrame:
+    """
+    Parsea todas las tablas del HTML y devuelve la que contiene
+    las columnas Fecha y HP DEMANDA SEIN.
+
+    Returns:
+        DataFrame crudo con columnas normalizadas.
 
     Raises:
-        RuntimeError: Si raw["Data"] no existe, está vacío o no hay datos HP.
-    """
-    puntos = raw.get("Data")
-    if not puntos:
-        raise RuntimeError(
-            "raw['Data'] vacío o ausente — la fuente oficial no devolvió datos."
-        )
-
-    logger.debug("[COES] raw['Data'] recibido: %d puntos", len(puntos))
-
-    registros = [r for p in puntos if (r := _parsear_punto_oficial(p)) is not None]
-
-    if not registros:
-        raise RuntimeError("No se pudieron parsear puntos válidos desde raw['Data'].")
-
-    df = pd.DataFrame(registros)
-
-    # Filtro Hora Punta
-    mask_hp = (df["hora"] >= _HP_HORA_INICIO) & (df["hora"] <= _HP_HORA_FIN)
-    df_hp = df[mask_hp].copy()
-
-    if df_hp.empty:
-        raise RuntimeError(
-            f"No hay datos en Hora Punta ({_HP_HORA_INICIO}:00–{_HP_HORA_FIN}:59) "
-            "en raw['Data']."
-        )
-
-    # Máximo por día (ValorEjecutado = valor oficial COES)
-    idx_max = df_hp.groupby("fecha")["potencia_maxima"].idxmax()
-    df_max = df_hp.loc[idx_max].reset_index(drop=True)
-
-    df_max["hora"] = df_max["hora"].astype(int)
-    df_max["minuto"] = df_max["minuto"].astype(int)
-    df_max["potencia_maxima"] = df_max["potencia_maxima"].astype(float)
-    df_max = df_max.sort_values("fecha").reset_index(drop=True)
-
-    return df_max[["fecha", "potencia_maxima", "hora", "minuto"]]
-
-
-# ---------------------------------------------------------------------------
-# FUENTE OPERATIVA: raw["Chart"]["Series"][0]["Data"] → Valor (tiempo real)
-# ---------------------------------------------------------------------------
-
-_RE_TIMESTAMP = re.compile(r"^(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):\d{2}$")
-
-
-def _extraer_puntos_chart(raw: dict) -> list[dict]:
-    """
-    Navega raw["Chart"]["Series"][0]["Data"] y devuelve la lista de puntos.
-
-    Raises:
-        RuntimeError: Si la estructura del JSON no coincide con lo esperado.
+        RuntimeError: Si no se encuentra ninguna tabla con la estructura esperada.
     """
     try:
-        series = raw["Chart"]["Series"]
-    except (KeyError, TypeError) as exc:
+        tablas = pd.read_html(StringIO(html), header=0)
+    except ValueError as exc:
         raise RuntimeError(
-            f"La estructura JSON no contiene 'Chart.Series'. "
-            f"Claves encontradas: {list(raw.keys()) if isinstance(raw, dict) else type(raw)}"
+            f"No se encontraron tablas HTML en la página del COES: {exc}"
         ) from exc
 
-    if not series:
-        raise RuntimeError("Chart.Series está vacío — no hay datos en la respuesta.")
+    logger.debug("[HTML] Tablas encontradas: %d", len(tablas))
 
-    puntos = series[0].get("Data", [])
-    if not puntos:
-        raise RuntimeError("Chart.Series[0].Data está vacío — sin datos para el período.")
+    for i, tabla in enumerate(tablas):
+        # Aplanar MultiIndex en columnas si existiera
+        if isinstance(tabla.columns, pd.MultiIndex):
+            tabla.columns = [" ".join(str(c) for c in col).strip() for col in tabla.columns]
+        else:
+            tabla.columns = [str(c).strip() for c in tabla.columns]
 
-    logger.debug("[COES] Chart.Series[0].Data recibido: %d puntos", len(puntos))
-    return puntos
+        col_fecha = _encontrar_columna(tabla.columns.tolist(), _COL_FECHA)
+        col_hp = _encontrar_columna(tabla.columns.tolist(), _COL_HP_SEIN)
+
+        if col_fecha and col_hp:
+            logger.debug(
+                "[HTML] Tabla %d seleccionada — columna fecha: %r | columna HP: %r",
+                i, col_fecha, col_hp,
+            )
+            return tabla.rename(columns={col_fecha: "__fecha__", col_hp: "__hp__"})
+
+    raise RuntimeError(
+        f"Ninguna de las {len(tablas)} tablas HTML contiene las columnas "
+        f"'{_COL_FECHA}' y '{_COL_HP_SEIN}'. "
+        "Verifique que la página del COES sigue la misma estructura."
+    )
 
 
-def _parsear_punto_chart(punto: dict) -> dict | None:
+def _construir_dataframe(tabla: pd.DataFrame, fecha_ini: str, fecha_fin: str) -> pd.DataFrame:
     """
-    Convierte un punto de Chart.Series[0].Data a dict con fecha, hora, minuto, potencia_maxima.
-    Formato de Nombre: "YYYY/MM/DD HH:MM:SS"
-    Retorna None si el punto no es válido.
-    """
-    nombre = (punto.get("Nombre") or "").strip()
-    valor = punto.get("Valor")
+    Limpia la tabla cruda y devuelve el DataFrame final filtrado al rango indicado.
 
-    if not nombre or valor is None:
-        return None
-
-    m = _RE_TIMESTAMP.match(nombre)
-    if not m:
-        logger.debug("Timestamp chart con formato inesperado: %r — omitido", nombre)
-        return None
-
-    anio, mes, dia, hora, minuto = m.groups()
-    try:
-        potencia = float(valor)
-    except (TypeError, ValueError):
-        logger.debug("Valor chart no numérico: %r — omitido", valor)
-        return None
-
-    return {
-        "fecha": f"{anio}-{mes}-{dia}",
-        "hora": int(hora),
-        "minuto": int(minuto),
-        "potencia_maxima": potencia,
-    }
-
-
-def _max_hp_chart(raw: dict) -> pd.DataFrame:
-    """
-    Extrae la máxima HP por día desde Chart.Series[0].Data.
-    Usado para el mes actual (datos operativos en tiempo real).
+    Returns:
+        DataFrame con columnas: fecha, potencia_maxima, hora, minuto, source.
 
     Raises:
-        RuntimeError: Si no hay datos HP o el parseo falla.
+        RuntimeError: Si tras la limpieza no quedan filas válidas en el período.
     """
-    puntos = _extraer_puntos_chart(raw)
-    registros = [r for p in puntos if (r := _parsear_punto_chart(p)) is not None]
+    registros = []
+    for _, fila in tabla.iterrows():
+        fecha = _parsear_fecha(fila["__fecha__"])
+        potencia = _limpiar_numero(fila["__hp__"])
+
+        if fecha is None or potencia is None:
+            logger.debug("Fila omitida — fecha: %r | hp: %r", fila["__fecha__"], fila["__hp__"])
+            continue
+
+        registros.append({
+            "fecha": fecha,
+            "potencia_maxima": potencia,
+            "hora": None,
+            "minuto": None,
+            "source": "html_coes_oficial",
+        })
 
     if not registros:
-        raise RuntimeError("No se pudieron parsear puntos válidos desde Chart.Series[0].Data.")
+        raise RuntimeError(
+            "No se pudieron parsear filas válidas desde la tabla HTML del COES."
+        )
 
     df = pd.DataFrame(registros)
 
-    mask_hp = (df["hora"] >= _HP_HORA_INICIO) & (df["hora"] <= _HP_HORA_FIN)
-    df_hp = df[mask_hp].copy()
+    # Filtrar al mes anterior
+    df = df[(df["fecha"] >= fecha_ini) & (df["fecha"] <= fecha_fin)].copy()
 
-    if df_hp.empty:
+    if df.empty:
         raise RuntimeError(
-            f"No hay datos en Hora Punta ({_HP_HORA_INICIO}:00–{_HP_HORA_FIN}:59) "
-            "en Chart.Series[0].Data."
+            f"La tabla HTML no contiene datos para el período {fecha_ini} → {fecha_fin}. "
+            "Es posible que el COES aún no haya publicado los datos oficiales del mes anterior."
         )
 
-    idx_max = df_hp.groupby("fecha")["potencia_maxima"].idxmax()
-    df_max = df_hp.loc[idx_max].reset_index(drop=True)
-
-    df_max["hora"] = df_max["hora"].astype(int)
-    df_max["minuto"] = df_max["minuto"].astype(int)
-    df_max["potencia_maxima"] = df_max["potencia_maxima"].astype(float)
-    df_max = df_max.sort_values("fecha").reset_index(drop=True)
-
-    return df_max[["fecha", "potencia_maxima", "hora", "minuto"]]
+    df = df.sort_values("fecha").reset_index(drop=True)
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Validaciones comunes
+# Validación
 # ---------------------------------------------------------------------------
 
-def _validar_dataframe(df: pd.DataFrame, dias_esperados: int, fuente: str) -> None:
+def _validar_dataframe(df: pd.DataFrame, dias_esperados: int) -> None:
     """
-    Valida que el DataFrame tenga sentido:
-    - Filas ≈ días del período (tolerancia ±2)
-    - Sin duplicados por fecha
-    - Sin valores nulos
-
-    Logs de advertencia sin levantar excepción para no interrumpir el pipeline.
+    Valida cobertura y consistencia del DataFrame resultante.
+    Emite advertencias sin interrumpir el pipeline.
     """
     if df.empty:
-        logger.warning("[COES] %s: DataFrame vacío — sin datos para validar.", fuente)
+        logger.warning("[COES HTML] DataFrame vacío — sin datos para validar.")
         return
 
-    # Nulos
-    nulos = df.isnull().sum().sum()
+    nulos = df[["fecha", "potencia_maxima"]].isnull().sum().sum()
     if nulos > 0:
-        logger.warning("[COES] %s: %d valores nulos detectados.", fuente, nulos)
+        logger.warning("[COES HTML] %d valores nulos en columnas clave.", nulos)
 
-    # Duplicados
     duplicados = df["fecha"].duplicated().sum()
     if duplicados > 0:
-        logger.warning("[COES] %s: %d fechas duplicadas detectadas.", fuente, duplicados)
+        logger.warning("[COES HTML] %d fechas duplicadas.", duplicados)
 
-    # Cobertura de días
     filas = len(df)
-    if abs(filas - dias_esperados) > 2:
+    if filas < 28 or filas > 31:
         logger.warning(
-            "[COES] %s: se esperaban ~%d días pero se obtuvieron %d filas.",
-            fuente, dias_esperados, filas,
+            "[COES HTML] Filas fuera del rango esperado (28–31): %d filas obtenidas.", filas
+        )
+    elif filas != dias_esperados:
+        logger.warning(
+            "[COES HTML] Se esperaban %d días pero se obtuvieron %d filas.",
+            dias_esperados, filas,
         )
 
 
@@ -412,56 +349,40 @@ def _validar_dataframe(df: pd.DataFrame, dias_esperados: int, fuente: str) -> No
 
 def obtener_potencia_historica_coes() -> pd.DataFrame:
     """
-    Obtiene la máxima demanda HP diaria del mes anterior desde el COES.
+    Obtiene la máxima demanda HP diaria oficial del mes anterior desde la tabla HTML del COES.
 
-    Selecciona automáticamente la fuente según el período:
-      - Mes anterior → raw["Data"].ValorEjecutado  (datos oficiales ejecutados)
-      - Mes actual   → Chart.Series[0].Data.Valor  (datos operativos en tiempo real)
+    Fuente: https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima
 
     Returns:
-        DataFrame con columnas: fecha (str YYYY-MM-DD), potencia_maxima (float),
-        hora (int), minuto (int). Una fila por día = máxima demanda en Hora Punta.
+        DataFrame con columnas:
+          - fecha          (str YYYY-MM-DD)
+          - potencia_maxima (float, MW)
+          - hora            (None)
+          - minuto          (None)
+          - source          ("html_coes_oficial")
+        Una fila por día. Solo el mes anterior completo.
 
     Raises:
         requests.HTTPError: Si el portal devuelve un error HTTP.
-        RuntimeError: Si la estructura de la respuesta no es la esperada o no hay datos.
-        ValueError: Si la respuesta no es JSON válido.
+        requests.exceptions.ConnectionError: Si no se pudo conectar al portal.
+        RuntimeError: Si la tabla no se encontró o no contiene datos del período esperado.
     """
-    fecha_inicial, fecha_final, anio_mes, mes_mes = _rango_mes_anterior()
-    dias_esperados = calendar.monthrange(anio_mes, mes_mes)[1]
+    fecha_ini, fecha_fin, anio, mes, dias_esperados = _rango_mes_anterior()
 
-    es_actual = _es_mes_actual(anio_mes, mes_mes)
-    fuente = "JSON operativo (Chart)" if es_actual else "JSON oficial (ValorEjecutado)"
+    print(f"[COES] Fuente: HTML oficial — período {fecha_ini} → {fecha_fin}")
+    logger.info("[COES] Período solicitado: %s → %s", fecha_ini, fecha_fin)
 
-    print(f"[COES] Usando fuente: {fuente}")
-    logger.info("[COES] Período solicitado: %s → %s | Fuente: %s", fecha_inicial, fecha_final, fuente)
+    html = _fetch_html()
+    tabla = _extraer_tabla_hp(html)
+    df = _construir_dataframe(tabla, fecha_ini, fecha_fin)
 
-    raw = _fetch_demanda(fecha_inicial, fecha_final)
+    _validar_dataframe(df, dias_esperados)
 
-    if es_actual:
-        df = _max_hp_chart(raw)
-    else:
-        # Intentar fuente oficial; fallback a Chart si falla
-        try:
-            df = _max_hp_oficial(raw)
-        except RuntimeError as exc:
-            logger.warning(
-                "[COES] Fuente oficial falló (%s) — usando Chart como fallback.", exc
-            )
-            print(f"[COES] ADVERTENCIA: fuente oficial no disponible ({exc}). Usando Chart como fallback.")
-            df = _max_hp_chart(raw)
-            fuente = "JSON operativo (Chart) [fallback]"
-
-    _validar_dataframe(df, dias_esperados, fuente)
-
-    if df.empty:
-        logger.warning("[COES] DataFrame resultante vacío.")
-    else:
-        print(f"[COES] Filas obtenidas: {len(df)}")
-        print(f"[COES] Rango: {df['fecha'].min()} → {df['fecha'].max()}")
-        logger.info(
-            "[COES] HP extraído (%s): %d días (%s → %s)",
-            fuente, len(df), df["fecha"].min(), df["fecha"].max(),
-        )
+    print(f"[COES] Filas obtenidas: {len(df)}")
+    print(f"[COES] Rango: {df['fecha'].min()} → {df['fecha'].max()}")
+    logger.info(
+        "[COES] HP oficial extraído: %d días (%s → %s)",
+        len(df), df["fecha"].min(), df["fecha"].max(),
+    )
 
     return df
