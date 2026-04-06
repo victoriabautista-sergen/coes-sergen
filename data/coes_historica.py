@@ -1,20 +1,21 @@
 """
 data/coes_historica.py
-Extrae la máxima demanda diaria HP oficial desde la tabla HTML del portal COES.
+Extrae la máxima demanda diaria HP oficial desde el endpoint AJAX del portal COES.
 
 Fuente:
-  GET https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima
+  POST https://www.coes.org.pe/Portal/portalinformacion/Demanda
+  payload: {"indicador": "maxima", "fechaInicial": ..., "fechaFinal": ...}
 
 Lógica:
-  - Descarga la página HTML con la tabla de demanda máxima.
-  - Extrae la tabla que contiene las columnas Fecha / HFP / HP DEMANDA SEIN.
+  - Consulta el endpoint AJAX que alimenta la tabla "Ranking de la demanda de potencia".
+  - Extrae la tabla de ranking (NO Chart.Series) con columnas fecha / hora / TOTAL HP.
   - Filtra al mes anterior completo.
   - Devuelve el valor oficial publicado por COES (usado en facturación).
 
 Función pública principal:
     obtener_potencia_historica_coes() -> pd.DataFrame
         Columnas: fecha (str YYYY-MM-DD), potencia_maxima (float),
-                  hora (None), minuto (None), source (str)
+                  hora (str HH:MM o None), minuto (None), source (str)
         Una fila por día = máxima demanda HP oficial COES.
 """
 
@@ -23,16 +24,13 @@ import logging
 import socket
 import time
 from datetime import date
-from io import StringIO
 
 import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
 
-_URL_HTML = (
-    "https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima"
-)
+_URL_AJAX = "https://www.coes.org.pe/Portal/portalinformacion/Demanda"
 
 _HEADERS = {
     "User-Agent": (
@@ -40,17 +38,15 @@ _HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
-    "Referer": "https://www.coes.org.pe/Portal/portalinformacion/demanda",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima",
 }
 
 _FETCH_RETRIES = 3
 _FETCH_RETRY_DELAY = 5  # segundos entre reintentos
-
-# Columna objetivo en la tabla HTML (búsqueda case-insensitive parcial)
-_COL_HP_SEIN = "hp demanda sein"
-_COL_FECHA = "fecha"
 
 
 # ---------------------------------------------------------------------------
@@ -75,22 +71,35 @@ def _rango_mes_anterior() -> tuple[str, str, int, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Descarga HTML
+# Descarga AJAX
 # ---------------------------------------------------------------------------
 
-def _fetch_html(timeout: int = 30) -> str:
+def _fetch_ranking_hp(fecha_inicial: str, fecha_final: str, timeout: int = 30) -> dict:
     """
-    Descarga el HTML de la página de demanda máxima del COES.
-    Reintenta hasta _FETCH_RETRIES veces ante errores de red.
+    Hace POST al endpoint AJAX del COES y devuelve el JSON parseado.
+
+    Args:
+        fecha_inicial: Fecha de inicio en formato YYYY-MM-DD.
+        fecha_final:   Fecha de fin en formato YYYY-MM-DD.
+        timeout:       Segundos de espera por intento.
 
     Returns:
-        Contenido HTML como string.
+        Diccionario con la respuesta JSON completa.
 
     Raises:
         requests.HTTPError: Si el servidor devuelve un código de error HTTP.
         requests.exceptions.ConnectionError: Si no se pudo establecer conexión.
+        ValueError: Si la respuesta no es JSON válido.
     """
-    logger.info("[NETWORK] GET %s", _URL_HTML)
+    payload = {
+        "indicador": "maxima",
+        "fechaInicial": fecha_inicial,
+        "fechaFinal": fecha_final,
+    }
+
+    logger.info("[NETWORK] POST %s | payload=%s", _URL_AJAX, payload)
+    print(f"[COES AJAX] POST {_URL_AJAX}")
+    print(f"[COES AJAX] Payload: {payload}")
 
     session = requests.Session()
     session.trust_env = False
@@ -100,9 +109,10 @@ def _fetch_html(timeout: int = 30) -> str:
     for intento in range(1, _FETCH_RETRIES + 1):
         try:
             logger.debug("[NETWORK] Intento %d/%d …", intento, _FETCH_RETRIES)
-            resp = session.get(
-                _URL_HTML,
+            resp = session.post(
+                _URL_AJAX,
                 headers=_HEADERS,
+                data=payload,
                 timeout=timeout,
                 proxies={"http": None, "https": None},
             )
@@ -130,13 +140,23 @@ def _fetch_html(timeout: int = 30) -> str:
                 logger.error("[NETWORK ERROR] Intento %d — Error de conexión: %s", intento, exc)
                 print(f"[ERROR CONEXIÓN] Error de conexión — intento {intento}/{_FETCH_RETRIES}")
         else:
-            logger.info("[NETWORK] COES OK — HTTP %d", resp.status_code)
+            logger.info("[NETWORK] COES AJAX OK — HTTP %d", resp.status_code)
+
+            print("\nJSON COMPLETO:")
+            print(resp.text)
+
             if resp.status_code != 200:
                 raise requests.HTTPError(
-                    f"El portal COES devolvió status {resp.status_code}. "
-                    f"URL: {_URL_HTML}"
+                    f"El portal COES devolvió status {resp.status_code}. URL: {_URL_AJAX}"
                 )
-            return resp.text
+
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise ValueError(
+                    f"La respuesta del COES no es JSON válido. "
+                    f"Primeros 500 chars: {resp.text[:500]}"
+                ) from exc
 
         if intento < _FETCH_RETRIES:
             logger.debug("[NETWORK] Reintentando en %ds …", _FETCH_RETRY_DELAY)
@@ -149,20 +169,8 @@ def _fetch_html(timeout: int = 30) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Parseo de la tabla HTML
+# Utilidades de parseo
 # ---------------------------------------------------------------------------
-
-def _encontrar_columna(columnas: list[str], patron: str) -> str | None:
-    """
-    Busca case-insensitivamente una columna cuyo nombre contenga `patron`.
-    Retorna el nombre real de la columna o None si no se encuentra.
-    """
-    patron_lower = patron.lower()
-    for col in columnas:
-        if patron_lower in str(col).lower():
-            return col
-    return None
-
 
 def _limpiar_numero(valor) -> float | None:
     """
@@ -172,17 +180,15 @@ def _limpiar_numero(valor) -> float | None:
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return None
     texto = str(valor).strip().replace(" ", "")
+    if not texto or texto == "-":
+        return None
     # Si tiene coma y punto, detectar cuál es el separador decimal
     if "," in texto and "." in texto:
-        # Formato europeo: 6.789,12 → punto=miles, coma=decimal
         if texto.rindex(",") > texto.rindex("."):
             texto = texto.replace(".", "").replace(",", ".")
         else:
-            # Formato anglosajón: 6,789.12 → coma=miles, punto=decimal
             texto = texto.replace(",", "")
     elif "," in texto:
-        # Solo comas: puede ser separador de miles o decimal
-        # Si hay exactamente una coma con 3 dígitos después → separador de miles
         partes = texto.split(",")
         if len(partes) == 2 and len(partes[1]) == 3 and partes[1].isdigit():
             texto = texto.replace(",", "")
@@ -199,114 +205,249 @@ def _parsear_fecha(valor) -> str | None:
     Intenta convertir el valor de fecha a formato YYYY-MM-DD.
     Acepta: datetime, date, strings con formatos DD/MM/YYYY, YYYY-MM-DD, DD-MM-YYYY.
     """
-    if pd.isnull(valor) if not isinstance(valor, str) else not valor:
+    if valor is None:
         return None
-
     if hasattr(valor, "strftime"):
         return valor.strftime("%Y-%m-%d")
 
     texto = str(valor).strip()
+    if not texto:
+        return None
+
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
         try:
             return pd.to_datetime(texto, format=fmt).strftime("%Y-%m-%d")
         except (ValueError, TypeError):
             continue
 
-    # Último recurso: pandas inferencia
     try:
         return pd.to_datetime(texto, dayfirst=True).strftime("%Y-%m-%d")
     except (ValueError, TypeError):
         return None
 
 
-def _extraer_tabla_hp(html: str) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Extracción del ranking HP desde JSON
+# ---------------------------------------------------------------------------
+
+def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
     """
-    Parsea todas las tablas del HTML y devuelve la que contiene
-    las columnas Fecha y HP DEMANDA SEIN.
+    Extrae la tabla de ranking HP (columna TOTAL) desde el JSON del endpoint AJAX.
 
-    Returns:
-        DataFrame crudo con columnas normalizadas.
+    El JSON contiene secciones de gráfico (Chart/Series) y tablas (tabla/ranking).
+    Esta función busca la sección de tabla/ranking, NO usa datos de Chart.Series.
 
-    Raises:
-        RuntimeError: Si no se encuentra ninguna tabla con la estructura esperada.
-    """
-    try:
-        tablas = pd.read_html(StringIO(html), header=0)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"No se encontraron tablas HTML en la página del COES: {exc}"
-        ) from exc
+    Estructura esperada (a confirmar con el JSON real):
+      data["tablaHp"] o data["ranking"] o data["data"] con lista de registros
+      Cada registro: {"fecha": ..., "hora": ..., "total": ...}
 
-    logger.debug("[HTML] Tablas encontradas: %d", len(tablas))
-
-    for i, tabla in enumerate(tablas):
-        # Aplanar MultiIndex en columnas si existiera
-        if isinstance(tabla.columns, pd.MultiIndex):
-            tabla.columns = [" ".join(str(c) for c in col).strip() for col in tabla.columns]
-        else:
-            tabla.columns = [str(c).strip() for c in tabla.columns]
-
-        col_fecha = _encontrar_columna(tabla.columns.tolist(), _COL_FECHA)
-        col_hp = _encontrar_columna(tabla.columns.tolist(), _COL_HP_SEIN)
-
-        if col_fecha and col_hp:
-            logger.debug(
-                "[HTML] Tabla %d seleccionada — columna fecha: %r | columna HP: %r",
-                i, col_fecha, col_hp,
-            )
-            return tabla.rename(columns={col_fecha: "__fecha__", col_hp: "__hp__"})
-
-    raise RuntimeError(
-        f"Ninguna de las {len(tablas)} tablas HTML contiene las columnas "
-        f"'{_COL_FECHA}' y '{_COL_HP_SEIN}'. "
-        "Verifique que la página del COES sigue la misma estructura."
-    )
-
-
-def _construir_dataframe(tabla: pd.DataFrame, fecha_ini: str, fecha_fin: str) -> pd.DataFrame:
-    """
-    Limpia la tabla cruda y devuelve el DataFrame final filtrado al rango indicado.
+    Args:
+        data: Diccionario JSON completo de la respuesta AJAX.
 
     Returns:
         DataFrame con columnas: fecha, potencia_maxima, hora, minuto, source.
 
     Raises:
-        RuntimeError: Si tras la limpieza no quedan filas válidas en el período.
+        RuntimeError: Si no se encuentra la estructura de ranking esperada.
+        KeyError: Si faltan campos clave en los registros.
     """
+    print("\n[DEBUG] Claves raíz del JSON:", list(data.keys()) if isinstance(data, dict) else type(data))
+
+    # Estrategia de búsqueda: buscar la sección de tabla/ranking
+    # (NO Chart, NO Series, NO grafico — solo datos tabulares de HP)
+    candidatos_tabla = []
+
+    if isinstance(data, dict):
+        for clave, valor in data.items():
+            clave_lower = clave.lower()
+            # Excluir secciones de gráfico
+            if any(x in clave_lower for x in ("chart", "serie", "grafico", "graf")):
+                print(f"[DEBUG] Ignorando clave de gráfico: {clave!r}")
+                continue
+            if isinstance(valor, list) and len(valor) > 0:
+                print(f"[DEBUG] Candidato tabla: clave={clave!r}, filas={len(valor)}, primera={valor[0]}")
+                candidatos_tabla.append((clave, valor))
+
+    if not candidatos_tabla:
+        # Si no hay listas en el nivel raíz, mostrar estructura completa para diagnóstico
+        raise RuntimeError(
+            f"No se encontraron listas de datos en el JSON. "
+            f"Claves disponibles: {list(data.keys()) if isinstance(data, dict) else 'N/A'}. "
+            "Revise el JSON COMPLETO impreso arriba para identificar la estructura."
+        )
+
+    # Seleccionar únicamente el dataset que cumpla TODAS las condiciones:
+    #   1. Entre 28 y 31 filas
+    #   2. Una fila por día (sin fechas duplicadas)
+    #   3. Sin timestamps con hora:minuto en el campo de fecha
+    #   4. Tiene campos de fecha y valor numérico (representa agregados diarios)
+    import re as _re
+    _PATRON_TIEMPO = _re.compile(r"\d{1,2}:\d{2}")
+
+    tabla_filas = None
+    clave_usada = None
+
+    for clave, filas in candidatos_tabla:
+        n = len(filas)
+        primera = filas[0] if filas else {}
+        if not isinstance(primera, dict):
+            print(f"[DEBUG] {clave!r}: descartado — registros no son dicts")
+            continue
+
+        campos = list(primera.keys())
+        campos_lower = [k.lower() for k in campos]
+        print(f"[DEBUG] {clave!r}: {n} filas | campos: {campos}")
+
+        # Condición 4 — debe tener campo de fecha y campo de valor numérico
+        tiene_fecha = any("fecha" in c or "date" in c for c in campos_lower)
+        tiene_valor = any(
+            x in c for c in campos_lower
+            for x in ("total", "potencia", "valor", "mw", "hp", "demanda")
+        )
+        if not (tiene_fecha and tiene_valor):
+            print(f"[DEBUG] {clave!r}: descartado — sin campo fecha ({tiene_fecha}) o valor ({tiene_valor})")
+            continue
+
+        # Condición 1 — entre 28 y 31 filas
+        if n < 28 or n > 31:
+            print(f"[DEBUG] {clave!r}: descartado — {n} filas (se requieren 28–31)")
+            continue
+
+        # Obtener campo de fecha para las siguientes validaciones
+        campo_fecha_cand = next(
+            (k for k in campos if "fecha" in k.lower() or "date" in k.lower()), None
+        )
+
+        # Condición 3 — sin timestamps con hora:minuto en los valores de fecha
+        tiene_timestamp = any(
+            _PATRON_TIEMPO.search(str(fila.get(campo_fecha_cand, "")))
+            for fila in filas
+            if isinstance(fila, dict)
+        )
+        if tiene_timestamp:
+            ejemplo = next(
+                str(fila.get(campo_fecha_cand, ""))
+                for fila in filas
+                if isinstance(fila, dict) and _PATRON_TIEMPO.search(str(fila.get(campo_fecha_cand, "")))
+            )
+            print(f"[DEBUG] {clave!r}: descartado — timestamps con hora en fecha (ej: {ejemplo!r})")
+            continue
+
+        # Condición 2 — una fila por día (sin duplicados)
+        fechas_parseadas = [
+            _parsear_fecha(fila.get(campo_fecha_cand))
+            for fila in filas
+            if isinstance(fila, dict)
+        ]
+        fechas_validas = [f for f in fechas_parseadas if f is not None]
+        if len(set(fechas_validas)) != n:
+            print(
+                f"[DEBUG] {clave!r}: descartado — fechas duplicadas "
+                f"({n} filas, {len(set(fechas_validas))} únicas)"
+            )
+            continue
+
+        # Dataset cumple todas las condiciones
+        tabla_filas = filas
+        clave_usada = clave
+        print(f"[DEBUG] Dataset seleccionado: {clave!r} ({n} filas, sin duplicados, sin timestamps)")
+        break
+
+    if tabla_filas is None:
+        resumen = ", ".join(
+            f"{c!r}({len(f)} filas)" for c, f in candidatos_tabla
+        )
+        raise RuntimeError(
+            "Ningún dataset cumple las condiciones requeridas "
+            "(28–31 filas, una fila por día, sin timestamps con hora:minuto, "
+            "con campos de fecha y valor numérico). "
+            f"Candidatos evaluados: {resumen}. "
+            "Revise el JSON COMPLETO impreso arriba para identificar la estructura."
+        )
+
+    # Identificar campos de fecha, hora y total en la primera fila
+    primera = tabla_filas[0] if tabla_filas else {}
+    if not isinstance(primera, dict):
+        raise RuntimeError(
+            f"Los registros en {clave_usada!r} no son diccionarios. "
+            f"Tipo encontrado: {type(primera)}. Valor: {primera}"
+        )
+
+    campos_disponibles = list(primera.keys())
+    print(f"[DEBUG] Campos de la tabla seleccionada: {campos_disponibles}")
+
+    # Buscar campo de fecha
+    campo_fecha = None
+    for k in campos_disponibles:
+        if "fecha" in k.lower() or "date" in k.lower():
+            campo_fecha = k
+            break
+
+    # Buscar campo de hora
+    campo_hora = None
+    for k in campos_disponibles:
+        if "hora" in k.lower() or "time" in k.lower():
+            campo_hora = k
+            break
+
+    # Buscar campo de total/potencia (TOTAL HP SEIN)
+    campo_total = None
+    prioridad_total = ("total", "hp", "potencia", "valor", "mw", "demanda")
+    for prioridad in prioridad_total:
+        for k in campos_disponibles:
+            if prioridad in k.lower():
+                campo_total = k
+                break
+        if campo_total:
+            break
+
+    if not campo_fecha:
+        raise RuntimeError(
+            f"No se encontró campo de fecha en los registros. "
+            f"Campos disponibles: {campos_disponibles}"
+        )
+    if not campo_total:
+        raise RuntimeError(
+            f"No se encontró campo de total/potencia en los registros. "
+            f"Campos disponibles: {campos_disponibles}"
+        )
+
+    print(f"[DEBUG] Mapeando — fecha: {campo_fecha!r}, hora: {campo_hora!r}, total: {campo_total!r}")
+
+    # Construir registros
     registros = []
-    for _, fila in tabla.iterrows():
-        fecha = _parsear_fecha(fila["__fecha__"])
-        potencia = _limpiar_numero(fila["__hp__"])
+    for fila in tabla_filas:
+        if not isinstance(fila, dict):
+            continue
+
+        fecha = _parsear_fecha(fila.get(campo_fecha))
+        potencia = _limpiar_numero(fila.get(campo_total))
+        hora_raw = fila.get(campo_hora) if campo_hora else None
+        hora = str(hora_raw).strip() if hora_raw is not None else None
 
         if fecha is None or potencia is None:
-            logger.debug("Fila omitida — fecha: %r | hp: %r", fila["__fecha__"], fila["__hp__"])
+            logger.debug(
+                "Fila omitida — fecha: %r | total: %r",
+                fila.get(campo_fecha), fila.get(campo_total),
+            )
             continue
 
         registros.append({
             "fecha": fecha,
             "potencia_maxima": potencia,
-            "hora": None,
+            "hora": hora,
             "minuto": None,
-            "source": "html_coes_oficial",
+            "source": "coes_oficial_ajax",
         })
 
     if not registros:
         raise RuntimeError(
-            "No se pudieron parsear filas válidas desde la tabla HTML del COES."
+            f"No se pudieron parsear filas válidas desde la sección {clave_usada!r}. "
+            "Revise el JSON COMPLETO impreso arriba."
         )
 
     df = pd.DataFrame(registros)
-
-    # Filtrar al mes anterior
-    df = df[(df["fecha"] >= fecha_ini) & (df["fecha"] <= fecha_fin)].copy()
-
-    if df.empty:
-        raise RuntimeError(
-            f"La tabla HTML no contiene datos para el período {fecha_ini} → {fecha_fin}. "
-            "Es posible que el COES aún no haya publicado los datos oficiales del mes anterior."
-        )
-
-    df = df.sort_values("fecha").reset_index(drop=True)
+    print(f"[DEBUG] Registros extraídos antes de filtro: {len(df)}")
     return df
 
 
@@ -320,25 +461,25 @@ def _validar_dataframe(df: pd.DataFrame, dias_esperados: int) -> None:
     Emite advertencias sin interrumpir el pipeline.
     """
     if df.empty:
-        logger.warning("[COES HTML] DataFrame vacío — sin datos para validar.")
+        logger.warning("[COES AJAX] DataFrame vacío — sin datos para validar.")
         return
 
     nulos = df[["fecha", "potencia_maxima"]].isnull().sum().sum()
     if nulos > 0:
-        logger.warning("[COES HTML] %d valores nulos en columnas clave.", nulos)
+        logger.warning("[COES AJAX] %d valores nulos en columnas clave.", nulos)
 
     duplicados = df["fecha"].duplicated().sum()
     if duplicados > 0:
-        logger.warning("[COES HTML] %d fechas duplicadas.", duplicados)
+        logger.warning("[COES AJAX] %d fechas duplicadas.", duplicados)
 
     filas = len(df)
     if filas < 28 or filas > 31:
         logger.warning(
-            "[COES HTML] Filas fuera del rango esperado (28–31): %d filas obtenidas.", filas
+            "[COES AJAX] Filas fuera del rango esperado (28–31): %d filas obtenidas.", filas
         )
     elif filas != dias_esperados:
         logger.warning(
-            "[COES HTML] Se esperaban %d días pero se obtuvieron %d filas.",
+            "[COES AJAX] Se esperaban %d días pero se obtuvieron %d filas.",
             dias_esperados, filas,
         )
 
@@ -349,32 +490,45 @@ def _validar_dataframe(df: pd.DataFrame, dias_esperados: int) -> None:
 
 def obtener_potencia_historica_coes() -> pd.DataFrame:
     """
-    Obtiene la máxima demanda HP diaria oficial del mes anterior desde la tabla HTML del COES.
+    Obtiene la máxima demanda HP diaria oficial del mes anterior desde el endpoint AJAX del COES.
 
-    Fuente: https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima
+    Fuente: POST https://www.coes.org.pe/Portal/portalinformacion/Demanda
+    Tabla:  Ranking de la demanda de potencia (columna TOTAL HP SEIN).
 
     Returns:
         DataFrame con columnas:
-          - fecha          (str YYYY-MM-DD)
+          - fecha           (str YYYY-MM-DD)
           - potencia_maxima (float, MW)
-          - hora            (None)
+          - hora            (str HH:MM o None)
           - minuto          (None)
-          - source          ("html_coes_oficial")
+          - source          ("coes_oficial_ajax")
         Una fila por día. Solo el mes anterior completo.
 
     Raises:
         requests.HTTPError: Si el portal devuelve un error HTTP.
         requests.exceptions.ConnectionError: Si no se pudo conectar al portal.
-        RuntimeError: Si la tabla no se encontró o no contiene datos del período esperado.
+        ValueError: Si la respuesta no es JSON válido.
+        RuntimeError: Si no se encontró la estructura de ranking esperada
+                      o no hay datos para el período solicitado.
     """
     fecha_ini, fecha_fin, anio, mes, dias_esperados = _rango_mes_anterior()
 
-    print(f"[COES] Fuente: HTML oficial — período {fecha_ini} → {fecha_fin}")
+    print(f"[COES] Fuente: AJAX oficial — período {fecha_ini} → {fecha_fin}")
     logger.info("[COES] Período solicitado: %s → %s", fecha_ini, fecha_fin)
 
-    html = _fetch_html()
-    tabla = _extraer_tabla_hp(html)
-    df = _construir_dataframe(tabla, fecha_ini, fecha_fin)
+    data = _fetch_ranking_hp(fecha_ini, fecha_fin)
+    df = _extraer_ranking_hp(data)
+
+    # Filtrar al mes solicitado
+    df = df[(df["fecha"] >= fecha_ini) & (df["fecha"] <= fecha_fin)].copy()
+
+    if df.empty:
+        raise RuntimeError(
+            f"La respuesta AJAX no contiene datos para el período {fecha_ini} → {fecha_fin}. "
+            "Es posible que el COES aún no haya publicado los datos oficiales del mes anterior."
+        )
+
+    df = df.sort_values("fecha").reset_index(drop=True)
 
     _validar_dataframe(df, dias_esperados)
 
