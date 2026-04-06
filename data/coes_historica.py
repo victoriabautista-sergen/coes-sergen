@@ -1,6 +1,6 @@
 """
 data/coes_historica.py
-Extrae la máxima demanda diaria HP oficial desde el endpoint AJAX del portal COES.
+Extrae la sección HP del ranking de demanda de potencia desde el portal COES.
 
 Fuente:
   POST https://www.coes.org.pe/Portal/portalinformacion/Demanda
@@ -8,15 +8,15 @@ Fuente:
 
 Lógica:
   - Consulta el endpoint AJAX que alimenta la tabla "Ranking de la demanda de potencia".
-  - Extrae la tabla de ranking (NO Chart.Series) con columnas fecha / hora / TOTAL HP.
+  - Extrae ÚNICAMENTE la sección HP (Hora Punta). Excluye HFP completamente.
   - Filtra al mes anterior completo.
-  - Devuelve el valor oficial publicado por COES (usado en facturación).
+  - Devuelve los datos oficiales publicados por COES sin cálculos ni transformaciones.
 
 Función pública principal:
     obtener_potencia_historica_coes() -> pd.DataFrame
-        Columnas: fecha (str YYYY-MM-DD), potencia_maxima (float),
-                  hora (str HH:MM o None), minuto (None), source (str)
-        Una fila por día = máxima demanda HP oficial COES.
+        Columnas: fecha (str YYYY-MM-DD), hp_hora (str HH:MM o None),
+                  hp_total (float), hp_importacion (float), hp_exportacion (float)
+        Una fila por día = sección HP del ranking oficial COES.
 """
 
 import calendar
@@ -230,214 +230,147 @@ def _parsear_fecha(valor) -> str | None:
 # Extracción del ranking HP desde JSON
 # ---------------------------------------------------------------------------
 
+def _campo_hp(campos: list[str], terminos: tuple[str, ...]) -> str | None:
+    """
+    Busca en `campos` el primero que contenga alguno de los `terminos`
+    Y que también contenga 'hp' (sin 'hfp') en su nombre.
+    """
+    for termino in terminos:
+        for k in campos:
+            k_lower = k.lower()
+            if termino in k_lower and "hp" in k_lower and "hfp" not in k_lower:
+                return k
+    return None
+
+
 def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
     """
-    Extrae la tabla de ranking HP (columna TOTAL) desde el JSON del endpoint AJAX.
+    Extrae ÚNICAMENTE la sección HP de la tabla de ranking desde el JSON AJAX.
 
-    El JSON contiene secciones de gráfico (Chart/Series) y tablas (tabla/ranking).
-    Esta función busca la sección de tabla/ranking, NO usa datos de Chart.Series.
-
-    Estructura esperada (a confirmar con el JSON real):
-      data["tablaHp"] o data["ranking"] o data["data"] con lista de registros
-      Cada registro: {"fecha": ..., "hora": ..., "total": ...}
+    Excluye completamente HFP. No realiza cálculos ni agregaciones.
 
     Args:
         data: Diccionario JSON completo de la respuesta AJAX.
 
     Returns:
-        DataFrame con columnas: fecha, potencia_maxima, hora, minuto, source.
+        DataFrame con columnas exactas:
+          fecha           (str YYYY-MM-DD)
+          hp_hora         (str HH:MM o None)
+          hp_total        (float)
+          hp_importacion  (float o None)
+          hp_exportacion  (float o None)
+        28–31 filas, una por día.
 
     Raises:
-        RuntimeError: Si no se encuentra la estructura de ranking esperada.
-        KeyError: Si faltan campos clave en los registros.
+        RuntimeError: Si no se encuentra la estructura esperada.
+        ValueError:   Si ningún candidato pasa la validación de rango/unicidad.
     """
     print("\n[DEBUG] Claves raíz del JSON:", list(data.keys()) if isinstance(data, dict) else type(data))
 
-    # Estrategia de búsqueda: buscar la sección de tabla/ranking
-    # (NO Chart, NO Series, NO grafico — solo datos tabulares de HP)
-    candidatos_tabla = []
+    # ── 1. Encontrar lista de registros ──────────────────────────────────────
+    # Prioridad: claves explícitas de tabla/ranking; fallback: cualquier lista
+    # que NO sea Chart/Series/gráfico.
+    filas: list | None = None
+    clave_usada: str | None = None
 
     if isinstance(data, dict):
-        for clave, valor in data.items():
-            clave_lower = clave.lower()
-            # Excluir secciones de gráfico
-            if any(x in clave_lower for x in ("chart", "serie", "grafico", "graf")):
-                print(f"[DEBUG] Ignorando clave de gráfico: {clave!r}")
-                continue
+        # Primero intentar claves que sugieren tabla de ranking
+        for clave in ("tablaHp", "TablaHp", "tabla_hp", "rankingHp",
+                      "Ranking", "ranking", "Data", "data", "Tabla", "tabla"):
+            valor = data.get(clave)
             if isinstance(valor, list) and len(valor) > 0:
-                print(f"[DEBUG] Candidato tabla: clave={clave!r}, filas={len(valor)}, primera={valor[0]}")
-                candidatos_tabla.append((clave, valor))
+                filas = valor
+                clave_usada = clave
+                print(f"[DEBUG] Candidato directo: {clave!r} ({len(filas)} filas)")
+                break
 
-    if not candidatos_tabla:
-        # Si no hay listas en el nivel raíz, mostrar estructura completa para diagnóstico
+        # Si no se encontró por nombre, buscar la primera lista no-gráfico con ≥28 filas
+        if filas is None:
+            for clave, valor in data.items():
+                if any(x in clave.lower() for x in ("chart", "serie", "grafico", "graf", "eje")):
+                    continue
+                if isinstance(valor, list) and len(valor) >= 28:
+                    filas = valor
+                    clave_usada = clave
+                    print(f"[DEBUG] Candidato fallback: {clave!r} ({len(filas)} filas)")
+                    break
+
+    if filas is None or not filas:
         raise RuntimeError(
-            f"No se encontraron listas de datos en el JSON. "
+            "No se encontró ninguna lista de datos en el JSON. "
             f"Claves disponibles: {list(data.keys()) if isinstance(data, dict) else 'N/A'}. "
-            "Revise el JSON COMPLETO impreso arriba para identificar la estructura."
+            "Revise el JSON COMPLETO impreso arriba."
         )
 
-    # Seleccionar únicamente el dataset que cumpla TODAS las condiciones:
-    #   1. Entre 28 y 31 filas
-    #   2. Una fila por día (sin fechas duplicadas)
-    #   3. Sin timestamps con hora:minuto en el campo de fecha
-    #   4. Tiene campos de fecha y valor numérico (representa agregados diarios)
-    import re as _re
-    _PATRON_TIEMPO = _re.compile(r"\d{1,2}:\d{2}")
-
-    tabla_filas = None
-    clave_usada = None
-
-    for clave, filas in candidatos_tabla:
-        n = len(filas)
-        primera = filas[0] if filas else {}
-        if not isinstance(primera, dict):
-            print(f"[DEBUG] {clave!r}: descartado — registros no son dicts")
-            continue
-
-        campos = list(primera.keys())
-        campos_lower = [k.lower() for k in campos]
-        print(f"[DEBUG] Evaluando dataset con {n} filas")
-
-        # Condición 4 — debe tener campo de fecha y campo de valor numérico
-        tiene_fecha = any("fecha" in c or "date" in c for c in campos_lower)
-        tiene_valor = any(
-            x in c for c in campos_lower
-            for x in ("total", "potencia", "valor", "mw", "hp", "demanda")
-        )
-        if not (tiene_fecha and tiene_valor):
-            print("[DEBUG] Rechazado: filas inválidas")
-            continue
-
-        # Condición 1 — entre 28 y 31 filas
-        if n < 28 or n > 31:
-            print("[DEBUG] Rechazado: filas inválidas")
-            continue
-
-        # Obtener campo de fecha para las siguientes validaciones
-        campo_fecha_cand = next(
-            (k for k in campos if "fecha" in k.lower() or "date" in k.lower()), None
-        )
-
-        # Condición 3 — sin timestamps con hora:minuto en los valores de fecha
-        tiene_timestamp = any(
-            _PATRON_TIEMPO.search(str(fila.get(campo_fecha_cand, "")))
-            for fila in filas
-            if isinstance(fila, dict)
-        )
-        if tiene_timestamp:
-            print("[DEBUG] Rechazado: contiene timestamps")
-            continue
-
-        # Condición 2 — una fila por día (sin duplicados)
-        fechas_parseadas = [
-            _parsear_fecha(fila.get(campo_fecha_cand))
-            for fila in filas
-            if isinstance(fila, dict)
-        ]
-        fechas_validas = [f for f in fechas_parseadas if f is not None]
-        if len(set(fechas_validas)) != n:
-            print("[DEBUG] Rechazado: duplicados")
-            continue
-
-        # Dataset cumple todas las condiciones
-        tabla_filas = filas
-        clave_usada = clave
-        print("[DEBUG] ✅ Dataset válido encontrado")
-        break
-
-    if tabla_filas is None:
-        resumen = ", ".join(
-            f"{c!r}({len(f)} filas)" for c, f in candidatos_tabla
-        )
-        raise ValueError(
-            "❌ No se encontró dataset válido de ranking diario del COES. "
-            f"Candidatos evaluados: {resumen}. "
-            "Revise el JSON COMPLETO impreso arriba para identificar la estructura."
-        )
-
-    # Identificar campos de fecha, hora y total en la primera fila
-    primera = tabla_filas[0] if tabla_filas else {}
+    primera = filas[0]
     if not isinstance(primera, dict):
         raise RuntimeError(
             f"Los registros en {clave_usada!r} no son diccionarios. "
-            f"Tipo encontrado: {type(primera)}. Valor: {primera}"
+            f"Tipo: {type(primera)}"
         )
 
-    campos_disponibles = list(primera.keys())
-    print(f"[DEBUG] Campos de la tabla seleccionada: {campos_disponibles}")
+    campos = list(primera.keys())
+    print(f"[DEBUG] Campos disponibles en {clave_usada!r}: {campos}")
 
-    # Buscar campo de fecha
-    campo_fecha = None
-    for k in campos_disponibles:
-        if "fecha" in k.lower() or "date" in k.lower():
-            campo_fecha = k
-            break
-
-    # Buscar campo de hora
-    campo_hora = None
-    for k in campos_disponibles:
-        if "hora" in k.lower() or "time" in k.lower():
-            campo_hora = k
-            break
-
-    # Buscar campo de total/potencia (TOTAL HP SEIN)
-    campo_total = None
-    prioridad_total = ("total", "hp", "potencia", "valor", "mw", "demanda")
-    for prioridad in prioridad_total:
-        for k in campos_disponibles:
-            if prioridad in k.lower():
-                campo_total = k
-                break
-        if campo_total:
-            break
-
+    # ── 2. Mapear campos HP ──────────────────────────────────────────────────
+    # Buscar campo de fecha (no necesariamente tiene "hp" en el nombre)
+    campo_fecha = next(
+        (k for k in campos if "fecha" in k.lower() or "date" in k.lower()), None
+    )
     if not campo_fecha:
+        raise RuntimeError(f"No se encontró campo de fecha. Campos: {campos}")
+
+    # Buscar campos HP específicos (deben contener "hp" pero no "hfp")
+    campo_hp_hora = _campo_hp(campos, ("hora", "time"))
+    campo_hp_total = _campo_hp(campos, ("total", "sein", "potencia", "valor", "mw", "demanda"))
+    campo_hp_importacion = _campo_hp(campos, ("import", "imp"))
+    campo_hp_exportacion = _campo_hp(campos, ("export", "exp"))
+
+    if not campo_hp_total:
         raise RuntimeError(
-            f"No se encontró campo de fecha en los registros. "
-            f"Campos disponibles: {campos_disponibles}"
-        )
-    if not campo_total:
-        raise RuntimeError(
-            f"No se encontró campo de total/potencia en los registros. "
-            f"Campos disponibles: {campos_disponibles}"
+            f"No se encontró campo HP Total. "
+            f"Campos con 'hp': {[k for k in campos if 'hp' in k.lower()]}"
         )
 
-    print(f"[DEBUG] Mapeando — fecha: {campo_fecha!r}, hora: {campo_hora!r}, total: {campo_total!r}")
+    print(
+        f"[DEBUG] Mapeo HP — fecha:{campo_fecha!r}, hora:{campo_hp_hora!r}, "
+        f"total:{campo_hp_total!r}, import:{campo_hp_importacion!r}, export:{campo_hp_exportacion!r}"
+    )
 
-    # Construir registros
+    # ── 3. Construir registros HP ────────────────────────────────────────────
     registros = []
-    for fila in tabla_filas:
+    for fila in filas:
         if not isinstance(fila, dict):
             continue
 
         fecha = _parsear_fecha(fila.get(campo_fecha))
-        potencia = _limpiar_numero(fila.get(campo_total))
-        hora_raw = fila.get(campo_hora) if campo_hora else None
-        hora = str(hora_raw).strip() if hora_raw is not None else None
-
-        if fecha is None or potencia is None:
-            logger.debug(
-                "Fila omitida — fecha: %r | total: %r",
-                fila.get(campo_fecha), fila.get(campo_total),
-            )
+        if fecha is None:
+            logger.debug("Fila omitida — fecha inválida: %r", fila.get(campo_fecha))
             continue
+
+        hp_hora_raw = fila.get(campo_hp_hora) if campo_hp_hora else None
+        hp_hora = str(hp_hora_raw).strip() if hp_hora_raw is not None else None
+
+        hp_total = _limpiar_numero(fila.get(campo_hp_total))
+        hp_importacion = _limpiar_numero(fila.get(campo_hp_importacion)) if campo_hp_importacion else None
+        hp_exportacion = _limpiar_numero(fila.get(campo_hp_exportacion)) if campo_hp_exportacion else None
 
         registros.append({
             "fecha": fecha,
-            "potencia_maxima": potencia,
-            "hora": hora,
-            "minuto": None,
-            "source": "coes_oficial_ajax",
+            "hp_hora": hp_hora,
+            "hp_total": hp_total,
+            "hp_importacion": hp_importacion,
+            "hp_exportacion": hp_exportacion,
         })
 
     if not registros:
         raise RuntimeError(
-            f"No se pudieron parsear filas válidas desde la sección {clave_usada!r}. "
+            f"No se pudieron parsear filas válidas desde {clave_usada!r}. "
             "Revise el JSON COMPLETO impreso arriba."
         )
 
     df = pd.DataFrame(registros)
-    print(f"[DEBUG] Registros extraídos antes de filtro: {len(df)}")
+    print(f"[DEBUG] Registros HP extraídos: {len(df)}")
     return df
 
 
@@ -445,11 +378,18 @@ def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
 # Validación
 # ---------------------------------------------------------------------------
 
+_COLUMNAS_HP = ("fecha", "hp_hora", "hp_total", "hp_importacion", "hp_exportacion")
+
+
 def _validar_dataframe(df: pd.DataFrame, dias_esperados: int = None) -> None:
     """
-    Valida cobertura y consistencia del DataFrame resultante.
+    Valida cobertura y consistencia del DataFrame HP resultante.
     Lanza ValueError si los datos no cumplen los criterios de calidad.
     """
+    columnas_faltantes = [c for c in _COLUMNAS_HP if c not in df.columns]
+    if columnas_faltantes:
+        raise ValueError(f"Columnas HP faltantes: {columnas_faltantes}")
+
     if len(df) < 28 or len(df) > 31:
         raise ValueError(
             f"Mes incompleto: se obtuvieron {len(df)} filas (se requieren 28–31)"
@@ -459,7 +399,7 @@ def _validar_dataframe(df: pd.DataFrame, dias_esperados: int = None) -> None:
         raise ValueError("Fechas duplicadas")
 
     if any(":" in str(f) for f in df["fecha"]):
-        raise ValueError("Contiene timestamps inválidos")
+        raise ValueError("Contiene timestamps inválidos en columna fecha")
 
 
 # ---------------------------------------------------------------------------
@@ -468,30 +408,31 @@ def _validar_dataframe(df: pd.DataFrame, dias_esperados: int = None) -> None:
 
 def obtener_potencia_historica_coes() -> pd.DataFrame:
     """
-    Obtiene la máxima demanda HP diaria oficial del mes anterior desde el endpoint AJAX del COES.
+    Obtiene la sección HP del ranking de demanda del mes anterior desde el COES.
 
     Fuente: POST https://www.coes.org.pe/Portal/portalinformacion/Demanda
-    Tabla:  Ranking de la demanda de potencia (columna TOTAL HP SEIN).
+    Tabla:  Ranking de la demanda de potencia — sección HP (Hora Punta).
 
     Returns:
         DataFrame con columnas:
           - fecha           (str YYYY-MM-DD)
-          - potencia_maxima (float, MW)
-          - hora            (str HH:MM o None)
-          - minuto          (None)
-          - source          ("coes_oficial_ajax")
-        Una fila por día. Solo el mes anterior completo.
+          - hp_hora         (str HH:MM o None)
+          - hp_total        (float, MW)
+          - hp_importacion  (float o None, MW)
+          - hp_exportacion  (float o None, MW)
+        28–31 filas, una por día, solo el mes anterior completo.
+        Sin cálculos ni transformaciones adicionales.
 
     Raises:
         requests.HTTPError: Si el portal devuelve un error HTTP.
         requests.exceptions.ConnectionError: Si no se pudo conectar al portal.
         ValueError: Si la respuesta no es JSON válido.
-        RuntimeError: Si no se encontró la estructura de ranking esperada
+        RuntimeError: Si no se encontró la estructura HP esperada
                       o no hay datos para el período solicitado.
     """
     fecha_ini, fecha_fin, anio, mes, dias_esperados = _rango_mes_anterior()
 
-    print("[COES] Fuente: AJAX ranking oficial")
+    print("[COES] Fuente: AJAX ranking oficial — sección HP")
     print(f"[COES] Período solicitado: {fecha_ini} → {fecha_fin}")
     logger.info("[COES] Período solicitado: %s → %s", fecha_ini, fecha_fin)
 
@@ -507,7 +448,7 @@ def obtener_potencia_historica_coes() -> pd.DataFrame:
 
     if df.empty:
         raise RuntimeError(
-            f"La respuesta AJAX no contiene datos para el período {fecha_ini} → {fecha_fin}. "
+            f"La respuesta AJAX no contiene datos HP para el período {fecha_ini} → {fecha_fin}. "
             "Es posible que el COES aún no haya publicado los datos oficiales del mes anterior."
         )
 
@@ -515,7 +456,7 @@ def obtener_potencia_historica_coes() -> pd.DataFrame:
 
     _validar_dataframe(df)
 
-    print(f"[COES] Filas obtenidas: {len(df)}")
+    print(f"[COES] Filas HP obtenidas: {len(df)}")
     print(f"[COES] Rango: {df['fecha'].min()} → {df['fecha'].max()}")
     logger.info(
         "[COES] HP oficial extraído: %d días (%s → %s)",
