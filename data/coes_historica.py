@@ -45,7 +45,7 @@ _HEADERS = {
     "Referer": "https://www.coes.org.pe/Portal/portalinformacion/demanda?indicador=maxima",
 }
 
-_FETCH_RETRIES = 3
+_FETCH_RETRIES = 2
 _FETCH_RETRY_DELAY = 5  # segundos entre reintentos
 
 
@@ -142,7 +142,7 @@ def _fetch_ranking_hp(fecha_inicial: str, fecha_final: str, timeout: int = 30) -
         else:
             logger.info("[NETWORK] COES AJAX OK — HTTP %d", resp.status_code)
 
-            print("\nJSON COMPLETO:")
+            print("[DEBUG] JSON COMPLETO:")
             print(resp.text)
 
             if resp.status_code != 200:
@@ -296,7 +296,7 @@ def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
 
         campos = list(primera.keys())
         campos_lower = [k.lower() for k in campos]
-        print(f"[DEBUG] {clave!r}: {n} filas | campos: {campos}")
+        print(f"[DEBUG] Evaluando dataset con {n} filas")
 
         # Condición 4 — debe tener campo de fecha y campo de valor numérico
         tiene_fecha = any("fecha" in c or "date" in c for c in campos_lower)
@@ -305,12 +305,12 @@ def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
             for x in ("total", "potencia", "valor", "mw", "hp", "demanda")
         )
         if not (tiene_fecha and tiene_valor):
-            print(f"[DEBUG] {clave!r}: descartado — sin campo fecha ({tiene_fecha}) o valor ({tiene_valor})")
+            print("[DEBUG] Rechazado: filas inválidas")
             continue
 
         # Condición 1 — entre 28 y 31 filas
         if n < 28 or n > 31:
-            print(f"[DEBUG] {clave!r}: descartado — {n} filas (se requieren 28–31)")
+            print("[DEBUG] Rechazado: filas inválidas")
             continue
 
         # Obtener campo de fecha para las siguientes validaciones
@@ -325,12 +325,7 @@ def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
             if isinstance(fila, dict)
         )
         if tiene_timestamp:
-            ejemplo = next(
-                str(fila.get(campo_fecha_cand, ""))
-                for fila in filas
-                if isinstance(fila, dict) and _PATRON_TIEMPO.search(str(fila.get(campo_fecha_cand, "")))
-            )
-            print(f"[DEBUG] {clave!r}: descartado — timestamps con hora en fecha (ej: {ejemplo!r})")
+            print("[DEBUG] Rechazado: contiene timestamps")
             continue
 
         # Condición 2 — una fila por día (sin duplicados)
@@ -341,26 +336,21 @@ def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
         ]
         fechas_validas = [f for f in fechas_parseadas if f is not None]
         if len(set(fechas_validas)) != n:
-            print(
-                f"[DEBUG] {clave!r}: descartado — fechas duplicadas "
-                f"({n} filas, {len(set(fechas_validas))} únicas)"
-            )
+            print("[DEBUG] Rechazado: duplicados")
             continue
 
         # Dataset cumple todas las condiciones
         tabla_filas = filas
         clave_usada = clave
-        print(f"[DEBUG] Dataset seleccionado: {clave!r} ({n} filas, sin duplicados, sin timestamps)")
+        print("[DEBUG] ✅ Dataset válido encontrado")
         break
 
     if tabla_filas is None:
         resumen = ", ".join(
             f"{c!r}({len(f)} filas)" for c, f in candidatos_tabla
         )
-        raise RuntimeError(
-            "Ningún dataset cumple las condiciones requeridas "
-            "(28–31 filas, una fila por día, sin timestamps con hora:minuto, "
-            "con campos de fecha y valor numérico). "
+        raise ValueError(
+            "❌ No se encontró dataset válido de ranking diario del COES. "
             f"Candidatos evaluados: {resumen}. "
             "Revise el JSON COMPLETO impreso arriba para identificar la estructura."
         )
@@ -455,33 +445,21 @@ def _extraer_ranking_hp(data: dict) -> pd.DataFrame:
 # Validación
 # ---------------------------------------------------------------------------
 
-def _validar_dataframe(df: pd.DataFrame, dias_esperados: int) -> None:
+def _validar_dataframe(df: pd.DataFrame, dias_esperados: int = None) -> None:
     """
     Valida cobertura y consistencia del DataFrame resultante.
-    Emite advertencias sin interrumpir el pipeline.
+    Lanza ValueError si los datos no cumplen los criterios de calidad.
     """
-    if df.empty:
-        logger.warning("[COES AJAX] DataFrame vacío — sin datos para validar.")
-        return
-
-    nulos = df[["fecha", "potencia_maxima"]].isnull().sum().sum()
-    if nulos > 0:
-        logger.warning("[COES AJAX] %d valores nulos en columnas clave.", nulos)
-
-    duplicados = df["fecha"].duplicated().sum()
-    if duplicados > 0:
-        logger.warning("[COES AJAX] %d fechas duplicadas.", duplicados)
-
-    filas = len(df)
-    if filas < 28 or filas > 31:
-        logger.warning(
-            "[COES AJAX] Filas fuera del rango esperado (28–31): %d filas obtenidas.", filas
+    if len(df) < 28 or len(df) > 31:
+        raise ValueError(
+            f"Mes incompleto: se obtuvieron {len(df)} filas (se requieren 28–31)"
         )
-    elif filas != dias_esperados:
-        logger.warning(
-            "[COES AJAX] Se esperaban %d días pero se obtuvieron %d filas.",
-            dias_esperados, filas,
-        )
+
+    if df["fecha"].duplicated().any():
+        raise ValueError("Fechas duplicadas")
+
+    if any(":" in str(f) for f in df["fecha"]):
+        raise ValueError("Contiene timestamps inválidos")
 
 
 # ---------------------------------------------------------------------------
@@ -513,11 +491,16 @@ def obtener_potencia_historica_coes() -> pd.DataFrame:
     """
     fecha_ini, fecha_fin, anio, mes, dias_esperados = _rango_mes_anterior()
 
-    print(f"[COES] Fuente: AJAX oficial — período {fecha_ini} → {fecha_fin}")
+    print("[COES] Fuente: AJAX ranking oficial")
+    print(f"[COES] Período solicitado: {fecha_ini} → {fecha_fin}")
     logger.info("[COES] Período solicitado: %s → %s", fecha_ini, fecha_fin)
 
-    data = _fetch_ranking_hp(fecha_ini, fecha_fin)
-    df = _extraer_ranking_hp(data)
+    try:
+        raw = _fetch_ranking_hp(fecha_ini, fecha_fin)
+    except Exception as exc:
+        raise RuntimeError("No se pudo obtener histórico oficial COES") from exc
+
+    df = _extraer_ranking_hp(raw)
 
     # Filtrar al mes solicitado
     df = df[(df["fecha"] >= fecha_ini) & (df["fecha"] <= fecha_fin)].copy()
@@ -530,7 +513,7 @@ def obtener_potencia_historica_coes() -> pd.DataFrame:
 
     df = df.sort_values("fecha").reset_index(drop=True)
 
-    _validar_dataframe(df, dias_esperados)
+    _validar_dataframe(df)
 
     print(f"[COES] Filas obtenidas: {len(df)}")
     print(f"[COES] Rango: {df['fecha'].min()} → {df['fecha'].max()}")
